@@ -181,7 +181,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
 
     std::vector<ID3D12Resource*> backBuffers;
-    const UINT rtvHeapSize = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    auto rtvHeapSize = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     ID3D12DescriptorHeap* rtvHeap = nullptr;
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
@@ -213,17 +213,19 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
     };
 
     struct Vertex {
         XMFLOAT3 pos;
+        XMFLOAT2 uv;
     };
 
     std::vector<Vertex> vertices = {
-        {{-1.0f, -1.0f, 0.0f}},
-        {{-1.0f,  1.0f, 0.0f}},
-        {{ 1.0f, -1.0f, 0.0f}},
-        {{ 1.0f,  1.0f, 0.0f}},
+        {{-1.0f, -1.0f, 0.0f}, {0.0f, 1.0f}},
+        {{-1.0f,  1.0f, 0.0f}, {0.0f, 0.0f}},
+        {{ 1.0f, -1.0f, 0.0f}, {1.0f, 1.0f}},
+        {{ 1.0f,  1.0f, 0.0f}, {1.0f, 0.0f}},
     };
 
     ID3D12Resource* vertBuff = nullptr;
@@ -342,8 +344,112 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         //constBuff->Unmap(0, nullptr);
     }
 
-    const UINT numDescs = 1;
-    const UINT descHeapSize = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    TexMetadata metadata = {};
+    ScratchImage scratchImg = {};
+    {
+        res = LoadFromWICFile(L"textures/myicon.png", WIC_FLAGS_NONE, &metadata, scratchImg);
+        ASSERT_RES(res, "LoadFromWICFile");
+    }
+    auto img = scratchImg.GetImage(0, 0, 0);
+
+    ID3D12Resource* texUploadBuff = nullptr;
+    {
+        D3D12_HEAP_PROPERTIES heapProp = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+        D3D12_RESOURCE_DESC resDesc = CD3DX12_RESOURCE_DESC::Buffer(AlignmentedSize(img->rowPitch, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) * img->height);
+
+        res = dev->CreateCommittedResource(&heapProp, D3D12_HEAP_FLAG_NONE, &resDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&texUploadBuff));
+        ASSERT_RES(res, "CreateCommittedResource");
+    }
+
+    ID3D12Resource* texBuff = nullptr;
+    {
+        D3D12_HEAP_PROPERTIES heapProp = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+
+        D3D12_RESOURCE_DESC resDesc = {};
+        resDesc.Format = metadata.format;
+        resDesc.Width = metadata.width;
+        resDesc.Height = metadata.height;
+        resDesc.DepthOrArraySize = metadata.arraySize;
+        resDesc.MipLevels = metadata.mipLevels;
+        resDesc.Dimension = static_cast<D3D12_RESOURCE_DIMENSION>(metadata.dimension);
+        resDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        resDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        resDesc.SampleDesc.Count = 1;
+        resDesc.SampleDesc.Quality = 0;
+
+        res = dev->CreateCommittedResource(&heapProp, D3D12_HEAP_FLAG_NONE, &resDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texBuff));
+        ASSERT_RES(res, "CreateCommittedResource");
+    }
+    {
+        uint8_t* texMap = nullptr;
+        res = texUploadBuff->Map(0, nullptr, (void**)&texMap);
+
+        auto srcAddr = img->pixels;
+        auto rowPitch = AlignmentedSize(img->rowPitch, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+        for (UINT y = 0; y < img->height; ++y) {
+            std::copy_n(srcAddr, img->rowPitch, texMap);
+            srcAddr += img->rowPitch;
+            texMap += rowPitch;
+        }
+        texUploadBuff->Unmap(0, nullptr); 
+    }
+
+    {
+        D3D12_TEXTURE_COPY_LOCATION srcTexLocation = {};
+        srcTexLocation.pResource = texUploadBuff;
+        srcTexLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        srcTexLocation.PlacedFootprint.Offset = 0;
+        srcTexLocation.PlacedFootprint.Footprint.Width = metadata.width;
+        srcTexLocation.PlacedFootprint.Footprint.Height = metadata.height;
+        srcTexLocation.PlacedFootprint.Footprint.Depth = metadata.depth;
+        srcTexLocation.PlacedFootprint.Footprint.RowPitch = AlignmentedSize(img->rowPitch, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+        srcTexLocation.PlacedFootprint.Footprint.Format = img->format;
+
+        D3D12_TEXTURE_COPY_LOCATION dstTexLocation = {};
+        dstTexLocation.pResource = texBuff;
+        dstTexLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dstTexLocation.SubresourceIndex = 0;
+
+        ID3D12Fence* fence = nullptr;
+        UINT fenceVal = 0;
+        res = dev->CreateFence(fenceVal, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+        ASSERT_RES(res, "CreateFence");
+
+        {
+            cmdList->CopyTextureRegion(&dstTexLocation, 0, 0, 0, &srcTexLocation, nullptr);
+
+            D3D12_RESOURCE_BARRIER barrierDesc = {};
+            barrierDesc.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrierDesc.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+            barrierDesc.Transition.pResource = texBuff;
+            barrierDesc.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barrierDesc.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            barrierDesc.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+            cmdList->ResourceBarrier(1, &barrierDesc);
+            cmdList->Close();
+
+            ID3D12CommandList* cmdlists[] = { cmdList };
+            cmdQueue->ExecuteCommandLists(1, cmdlists);
+
+            cmdQueue->Signal(fence, ++fenceVal);
+        }
+        
+        if (fence->GetCompletedValue() != fenceVal) {
+            auto event = CreateEvent(nullptr, false, false, nullptr);
+            fence->SetEventOnCompletion(fenceVal, event);
+            if (event != 0) {
+                WaitForSingleObject(event, INFINITE);
+                CloseHandle(event);
+            }
+        }
+
+        cmdAllocator->Reset();
+        cmdList->Reset(cmdAllocator, nullptr);
+    }
+
+    const UINT numDescs = 2;
+    auto descHeapSize = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     ID3D12DescriptorHeap* descHeap = nullptr;
     {
         D3D12_DESCRIPTOR_HEAP_DESC descHeapDesc = {};
@@ -364,15 +470,30 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             dev->CreateConstantBufferView(&cbvDesc, descHandle);
         }
         descHandle.ptr += descHeapSize;
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+            srvDesc.Format = metadata.format;
+            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MipLevels = 1;
+            
+            dev->CreateShaderResourceView(texBuff, &srvDesc, descHandle);
+        }
+        descHandle.ptr += descHeapSize;
     }
 
-    const UINT numDescRanges = 1;
+    const UINT numDescRanges = numDescs;
     D3D12_DESCRIPTOR_RANGE descRanges[numDescRanges] = {};
     {
-        descRanges[0].NumDescriptors = numDescs;
+        descRanges[0].NumDescriptors = 1;
         descRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
         descRanges[0].BaseShaderRegister = 0;
         descRanges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        descRanges[1].NumDescriptors = 1;
+        descRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        descRanges[1].BaseShaderRegister = 0;
+        descRanges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
     }
 
     const UINT numRootParams = 1;
@@ -386,10 +507,23 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     ID3D12RootSignature* rootSignature = {};
     {
+        D3D12_STATIC_SAMPLER_DESC samplerDesc = {};
+        samplerDesc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samplerDesc.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samplerDesc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samplerDesc.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+        samplerDesc.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+        samplerDesc.MaxLOD = D3D12_FLOAT32_MAX;
+        samplerDesc.MinLOD = 0.0f;
+        samplerDesc.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        samplerDesc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+
         D3D12_ROOT_SIGNATURE_DESC rootsigDesc = {};
         rootsigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
         rootsigDesc.pParameters = rootParams;
         rootsigDesc.NumParameters = numRootParams;
+        rootsigDesc.pStaticSamplers = &samplerDesc;
+        rootsigDesc.NumStaticSamplers = 1;
 
         ID3DBlob* rootsigBlob = nullptr;
         ID3DBlob* errorBlob = nullptr;
@@ -445,10 +579,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     D3D12_RECT scissorrect = {};
     {
-        scissorrect.top = viewport.TopLeftY;
-        scissorrect.left = viewport.TopLeftX;
-        scissorrect.right = scissorrect.left + viewport.Width;
-        scissorrect.bottom = scissorrect.top + viewport.Height;
+        scissorrect.top = static_cast<long>(viewport.TopLeftY);
+        scissorrect.left = static_cast<long>(viewport.TopLeftX);
+        scissorrect.right = static_cast<long>(scissorrect.left + viewport.Width);
+        scissorrect.bottom = static_cast<long>(scissorrect.top + viewport.Height);
     }
 
     ShowWindow(hwnd, SW_SHOW);
@@ -496,7 +630,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         {
             auto descHandle = descHeap->GetGPUDescriptorHandleForHeapStart();
             cmdList->SetGraphicsRootDescriptorTable(0, descHandle);
-            descHandle.ptr += descHeapSize;
+            descHandle.ptr += descHeapSize * rootParams[0].DescriptorTable.NumDescriptorRanges;
         }
 
         cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -534,11 +668,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         cmdQueue->ExecuteCommandLists(1, cmdlists);
 
         cmdQueue->Signal(fence, ++fenceVal);
+
         if (fence->GetCompletedValue() != fenceVal) {
             auto event = CreateEvent(nullptr, false, false, nullptr);
             fence->SetEventOnCompletion(fenceVal, event);
-            WaitForSingleObject(event, INFINITE);
-            CloseHandle(event);
+            if (event != 0) {
+                WaitForSingleObject(event, INFINITE);
+                CloseHandle(event);
+            }
         }
 
         cmdAllocator->Reset();
